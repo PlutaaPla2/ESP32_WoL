@@ -57,7 +57,7 @@ W5500 Lite pin labels are abbreviated. Full mapping:
 | MI | MISO | GPIO 19 |
 | SCK | SPI clock | GPIO 18 |
 | CS | Chip select | GPIO 5 |
-| RST | Reset | GPIO 26 (optional but recommended for 24/7 use) |
+| RST | Reset | GPIO 26 (optional but recommended for 24/7 use — set `W5500_RST = -1` in the sketch if not wired) |
 | NT | Interrupt | Not connected |
 | NC | Not connected | Not connected |
 
@@ -164,6 +164,10 @@ The ESP32 publishes a confirmation back to the same topic:
 ```json
 { "status": "sent", "msg": "Magic packet sent via Ethernet — PC should wake shortly" }
 ```
+If the packet could not be sent (most often: no Ethernet link to the PC):
+```json
+{ "status": "failed", "msg": "No Ethernet link to the PC" }
+```
 
 ---
 
@@ -175,6 +179,14 @@ Includes all fixes discovered during debugging:
 - Guard against the ESP32 reacting to its own confirmation messages
 - Guard against payloads with no token
 - WiFi handles MQTT; W5500 handles the magic packet
+- The WoL socket is opened at boot even if the link is down (previously a PC
+  that was off / still negotiating at boot left WoL dead until the ESP32 was reset)
+- The link is polled every second and logged (`Link UP` / `Link DOWN`); if it
+  stays down the W5500 PHY is restarted, alternating auto-negotiation and
+  forced 10 Mbps
+- The W5500 is re-initialised automatically if it resets or loses its config
+- The magic packet is sent 3 times, only when the link is up, and the
+  confirmation reports `"status": "failed"` with the reason when it could not be sent
 
 ```cpp
 #include <WiFi.h>
@@ -183,6 +195,7 @@ Includes all fixes discovered during debugging:
 #include <SPI.h>
 #include <Ethernet.h>
 #include <EthernetUdp.h>
+#include <utility/w5100.h>   // direct W5500 PHY register access (link recovery)
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <TOTP.h>
@@ -211,12 +224,19 @@ IPAddress W5500_IP(192, 168, 1, 200);
 IPAddress W5500_DNS(192, 168, 1, 1);
 IPAddress W5500_GW(192, 168, 1, 1);
 IPAddress W5500_SUBNET(255, 255, 255, 0);
-const int W5500_CS = 5;
+const int W5500_CS  = 5;
+const int W5500_RST = 26;   // W5500 RST pin (section 2). Set to -1 if not wired.
 
 // Target PC — ETHERNET adapter MAC (not WiFi), from getmac (section 4c)
 uint8_t PC_MAC[6] = { 0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6 };
 
 const int WOL_PORT = 9;
+
+// Link handling
+const unsigned long ETH_POLL_MS        = 1000;   // how often the link is checked
+const unsigned long LINK_RECOVERY_MS   = 10000;  // link down this long -> restart PHY
+const unsigned long LINK_WAIT_MS       = 4000;   // wait this long for link on a wake command
+const int           WOL_REPEAT         = 3;      // magic packets per wake command
 
 // ============================================================
 //  INTERNALS
@@ -229,27 +249,187 @@ NTPClient        timeClient(ntpUDP, "pool.ntp.org", 0, 60000);
 TOTP             totp(TOTP_SECRET, sizeof(TOTP_SECRET));
 EthernetUDP      wolUDP;
 
-void sendMagicPacket() {
+bool               ethReady      = false;     // W5500 found and UDP socket open
+EthernetLinkStatus lastLink      = Unknown;
+unsigned long      linkDownSince = 0;
+unsigned long      lastEthPoll   = 0;
+unsigned long      lastEthInit   = 0;
+bool               phyForced10M  = false;
+
+// W5500 PHYCFGR bits
+const uint8_t PHY_RST       = 0x80;  // 0 = PHY in reset
+const uint8_t PHY_OPMD      = 0x40;  // 1 = mode set by software (bits below)
+const uint8_t PHY_MODE_AUTO = 0x38;  // all capable, auto-negotiation
+const uint8_t PHY_MODE_10HD = 0x00;  // forced 10BASE-T half duplex
+const uint8_t PHY_DPX       = 0x04;  // 1 = full duplex
+const uint8_t PHY_SPD       = 0x02;  // 1 = 100 Mbps
+
+uint8_t readPhyCfg() {
+    SPI.beginTransaction(SPI_ETHERNET_SETTINGS);
+    uint8_t cfg = W5100.getPHYCFGR_W5500();
+    SPI.endTransaction();
+    return cfg;
+}
+
+void writePhyCfg(uint8_t cfg) {
+    SPI.beginTransaction(SPI_ETHERNET_SETTINGS);
+    W5100.setPHYCFGR_W5500(cfg);
+    SPI.endTransaction();
+}
+
+// Set the PHY operating mode and reset the PHY so the link is negotiated again.
+void restartPhy(uint8_t modeBits) {
+    if (Ethernet.hardwareStatus() != EthernetW5500) return;
+    uint8_t cfg = PHY_OPMD | modeBits;
+    writePhyCfg(cfg | PHY_RST);
+    writePhyCfg(cfg);              // RST low = reset
+    delay(2);
+    writePhyCfg(cfg | PHY_RST);
+}
+
+void printLinkUp() {
+    uint8_t cfg = readPhyCfg();
+    Serial.printf("[W5500] Link UP (%s Mbps, %s duplex)\n",
+                  (cfg & PHY_SPD) ? "100" : "10",
+                  (cfg & PHY_DPX) ? "full" : "half");
+}
+
+// Returns true when the W5500 answers and the WoL socket is open.
+// The link does NOT have to be up — it is watched by serviceEthernet().
+bool initEthernet() {
+    ethReady    = false;
+    lastEthInit = millis();
+
+    if (W5500_RST >= 0) {
+        pinMode(W5500_RST, OUTPUT);
+        digitalWrite(W5500_RST, LOW);
+        delay(5);
+        digitalWrite(W5500_RST, HIGH);
+        delay(200);
+    }
+
+    Ethernet.init(W5500_CS);
+    Ethernet.begin(W5500_MAC, W5500_IP, W5500_DNS, W5500_GW, W5500_SUBNET);
+
+    if (Ethernet.hardwareStatus() == EthernetNoHardware) {
+        Serial.println("[W5500] Hardware not found — check SPI wiring! Will retry.");
+        return false;
+    }
+
+    // Open the socket no matter what the link is doing. A UDP socket does not
+    // need a link to be opened, and the PC may only link up later.
+    wolUDP.stop();
+    if (!wolUDP.begin(WOL_PORT)) {
+        Serial.println("[W5500] Could not open UDP socket! Will retry.");
+        return false;
+    }
+
+    phyForced10M  = false;
+    lastLink      = Unknown;
+    linkDownSince = millis();
+    ethReady      = true;
+    Serial.printf("[W5500] Ready! IP: %s — waiting for link\n",
+                  Ethernet.localIP().toString().c_str());
+    return true;
+}
+
+// Call often from loop(). Tracks the link, recovers a stuck PHY and
+// re-initialises the W5500 if it lost its configuration (brown-out, reset).
+void serviceEthernet() {
+    unsigned long now = millis();
+    if (now - lastEthPoll < ETH_POLL_MS) return;
+    lastEthPoll = now;
+
+    if (!ethReady) {
+        if (now - lastEthInit >= LINK_RECOVERY_MS) initEthernet();
+        return;
+    }
+
+    // The chip forgets its IP when it resets — use that to detect it.
+    if (!(Ethernet.localIP() == W5500_IP)) {
+        Serial.println("[W5500] Chip lost its config (reset?) — re-initialising");
+        initEthernet();
+        return;
+    }
+
+    EthernetLinkStatus link = Ethernet.linkStatus();
+    if (link != lastLink) {
+        lastLink      = link;
+        linkDownSince = now;
+        if (link == LinkON) printLinkUp();
+        else                Serial.println("[W5500] Link DOWN");
+    }
+
+    // Link stayed down: restart the PHY, alternating between normal
+    // auto-negotiation and forced 10 Mbps. A powered-off PC keeps its NIC in a
+    // low-power 10 Mbps mode that does not always negotiate cleanly.
+    if (link != LinkON && now - linkDownSince >= LINK_RECOVERY_MS) {
+        phyForced10M = !phyForced10M;
+        Serial.printf("[W5500] Still no link — restarting PHY (%s)\n",
+                      phyForced10M ? "forced 10M half" : "auto-negotiation");
+        restartPhy(phyForced10M ? PHY_MODE_10HD : PHY_MODE_AUTO);
+        linkDownSince = now;
+    }
+}
+
+bool waitForLink(unsigned long timeoutMs) {
+    unsigned long start = millis();
+    while (Ethernet.linkStatus() != LinkON) {
+        if (millis() - start >= timeoutMs) return false;
+        delay(100);
+    }
+    return true;
+}
+
+// Returns nullptr on success, otherwise a short reason for the failure.
+const char* sendMagicPacket() {
+    if (!ethReady && !initEthernet()) return "W5500 not responding";
+
+    // Never send without a link: the packet cannot reach the PC and the
+    // W5500 may never report the send as finished.
+    if (!waitForLink(LINK_WAIT_MS)) {
+        Serial.println("[WoL] No Ethernet link to the PC — packet NOT sent");
+        return "No Ethernet link to the PC";
+    }
+
     uint8_t packet[102];
     for (int i = 0; i < 6; i++) packet[i] = 0xFF;
     for (int rep = 0; rep < 16; rep++)
         for (int b = 0; b < 6; b++)
             packet[6 + rep * 6 + b] = PC_MAC[b];
 
-    wolUDP.beginPacket(IPAddress(255, 255, 255, 255), WOL_PORT);
-    wolUDP.write(packet, sizeof(packet));
-    wolUDP.endPacket();
+    int sent = 0;
+    for (int n = 0; n < WOL_REPEAT; n++) {
+        if (wolUDP.beginPacket(IPAddress(255, 255, 255, 255), WOL_PORT) &&
+            wolUDP.write(packet, sizeof(packet)) == sizeof(packet) &&
+            wolUDP.endPacket()) {
+            sent++;
+        }
+        delay(100);
+    }
 
-    Serial.println("[WoL] Magic packet sent via W5500 Ethernet!");
+    if (sent == 0) {
+        Serial.println("[WoL] W5500 refused the packet — re-initialising");
+        initEthernet();
+        return "W5500 send failed";
+    }
+
+    Serial.printf("[WoL] Magic packet sent via W5500 Ethernet (%d/%d)\n", sent, WOL_REPEAT);
     Serial.printf("[WoL] Target MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
         PC_MAC[0], PC_MAC[1], PC_MAC[2], PC_MAC[3], PC_MAC[4], PC_MAC[5]);
+    return nullptr;
 }
 
-void publishConfirmation() {
-    StaticJsonDocument<128> doc;
-    doc["status"] = "sent";
-    doc["msg"]    = "Magic packet sent via Ethernet — PC should wake shortly";
-    char buffer[128];
+void publishConfirmation(const char* error) {
+    StaticJsonDocument<192> doc;
+    if (error) {
+        doc["status"] = "failed";
+        doc["msg"]    = error;
+    } else {
+        doc["status"] = "sent";
+        doc["msg"]    = "Magic packet sent via Ethernet — PC should wake shortly";
+    }
+    char buffer[192];
     serializeJson(doc, buffer);
     mqtt.publish(MQTT_TOPIC, buffer);
     Serial.println("[MQTT] Confirmation published");
@@ -301,8 +481,7 @@ void onMessage(char* topic, byte* payload, unsigned int length) {
 
     if (strcmp(cmd, "wake") == 0) {
         Serial.println("[TOTP] Token valid — sending WoL");
-        sendMagicPacket();
-        publishConfirmation();
+        publishConfirmation(sendMagicPacket());
     }
 }
 
@@ -312,21 +491,6 @@ void connectWiFi() {
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
     Serial.printf("\n[WiFi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
-}
-
-void initEthernet() {
-    Ethernet.init(W5500_CS);
-    Ethernet.begin(W5500_MAC, W5500_IP, W5500_DNS, W5500_GW, W5500_SUBNET);
-    delay(1000);
-
-    if (Ethernet.hardwareStatus() == EthernetNoHardware) {
-        Serial.println("[W5500] Hardware not found — check SPI wiring!");
-    } else if (Ethernet.linkStatus() == LinkOFF) {
-        Serial.println("[W5500] Cable not connected!");
-    } else {
-        Serial.printf("[W5500] Ready! IP: %s\n", Ethernet.localIP().toString().c_str());
-        wolUDP.begin(WOL_PORT);
-    }
 }
 
 void connectMQTT() {
@@ -366,6 +530,7 @@ void setup() {
 void loop() {
     if (WiFi.status() != WL_CONNECTED) connectWiFi();
     if (!mqtt.connected()) connectMQTT();
+    serviceEthernet();
     timeClient.update();
     mqtt.loop();
 }
@@ -377,25 +542,40 @@ void loop() {
 
 1. **Wiring test** — flash the minimal detection sketch below first.
    Expect `W5500 detected!` and `Cable link UP` (with cable plugged into PC).
+   Leave it running and shut the PC down: the link may drop for a few seconds
+   but must come back UP while the PC is off. If it stays DOWN, the PC's NIC is
+   not powered for WoL (see section 9).
 
 ```cpp
 #include <SPI.h>
 #include <Ethernet.h>
+// Wiring + link test. Leave it running and watch the link while you plug the
+// cable, shut the PC down, sleep it, etc. The link must stay (or come back) UP
+// with the PC off — otherwise the magic packet can never reach it.
 byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
+EthernetLinkStatus last = Unknown;
+bool first = true;
 void setup() {
     Serial.begin(115200);
     delay(1000);
     Ethernet.init(5);
     Ethernet.begin(mac, IPAddress(192,168,1,200));
-    delay(1000);
     if (Ethernet.hardwareStatus() == EthernetNoHardware)
         Serial.println("W5500 NOT detected — check SPI wiring");
-    else {
+    else
         Serial.println("W5500 detected!");
-        Serial.println(Ethernet.linkStatus() == LinkON ? "Cable link UP" : "Cable link DOWN");
-    }
 }
-void loop() {}
+void loop() {
+    if (Ethernet.hardwareStatus() == EthernetNoHardware) return;
+    EthernetLinkStatus now = Ethernet.linkStatus();
+    if (first || now != last) {
+        Serial.printf("[%lus] %s\n", millis() / 1000,
+                      now == LinkON ? "Cable link UP" : "Cable link DOWN");
+        last = now;
+        first = false;
+    }
+    delay(200);
+}
 ```
 
 2. **Flash the full sketch** — serial monitor should show WiFi, W5500, NTP,
@@ -410,6 +590,9 @@ void loop() {}
 |---|---|
 | `W5500 NOT detected` | MOSI/MISO swapped, wrong CS pin, wires too long |
 | `Cable link DOWN` | Cable unplugged, or PC fully unpowered at the wall |
+| Link DOWN only while the PC is off | NIC not kept powered: BIOS ErP/Deep Sleep must be OFF, Fast Startup OFF, adapter Advanced tab: "Shutdown Wake-On-Lan" = Enabled, "Energy Efficient Ethernet" / "Green Ethernet" = Disabled |
+| Link never comes UP when the cable is plugged into a PC that is off | The W5500 has no Auto-MDIX and a sleeping NIC may not do it either — use a crossover cable, or put a small switch between W5500 and PC |
+| `"status": "failed"`, `No Ethernet link to the PC` | Same as the two rows above — watch the serial log for `Link UP` / `Link DOWN` |
 | `Token mismatch` but tokens look equal | TOTP buffer bug — verify the strncpy fix is in place |
 | Token mismatch after own confirmation | Normal if guards missing — verify Guard 1 & 2 |
 | Packet sent but PC doesn't wake | Wrong MAC (WiFi vs Ethernet), BIOS WoL off, Fast Startup on |
